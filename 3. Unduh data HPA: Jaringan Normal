@@ -1,0 +1,273 @@
+# ============================================================
+# CCND1 - cervix (NORMAL tissue) - antibodi CAB080462
+# Sumber data: XML gen HPA
+# Output: Downloads/HPA_CCND1_cervix_CAB080462/
+# Versi perbaikan: Quantity & Location terbaca, parser generik
+# ============================================================
+pkgs <- c("xml2", "httr", "dplyr", "purrr", "stringr", "openxlsx", "magick", "readr", "tibble")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# --- Parameter ----------------------------------------------
+gene_name    <- "CCND1"
+gene_id      <- "ENSG00000110092"
+tissue_label <- "cervix"
+tissue_regex <- "cervix"          # filter jaringan
+diag_regex   <- "Normal tissue"   # normal tissue (ganti "carcinoma" untuk kanker)
+target_ab    <- "CAB080462"
+cell_types   <- c("Glandular cells", "Squamous epithelial cells")
+excel_px     <- "700x700"   # ketajaman gambar di dalam Excel
+img_px       <- 300         # ukuran tampil di Excel
+
+downloads <- file.path(Sys.getenv("USERPROFILE"), "Downloads")
+if (downloads == "Downloads") downloads <- file.path(path.expand("~"), "Downloads")
+out_dir <- file.path(downloads, paste0("HPA_", gene_name, "_", tissue_label, "_", target_ab))
+img_dir <- file.path(out_dir, "images")
+
+# --- Bersihkan hasil lama (pastikan Excel sudah ditutup) ----
+unlink(img_dir, recursive = TRUE)
+if (dir.exists(out_dir)) {
+  file.remove(list.files(out_dir, pattern = "\\.(xlsx|csv|txt)$", full.names = TRUE))
+}
+dir.create(img_dir, recursive = TRUE, showWarnings = FALSE)
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# --- XML gen ------------------------------------------------
+xf <- file.path(out_dir, paste0(gene_id, ".xml"))
+if (!file.exists(xf)) {
+  download.file(paste0("https://www.proteinatlas.org/", gene_id, ".xml"), xf, mode = "wb", quiet = TRUE)
+}
+doc   <- read_xml(xf)
+nodes <- xml_find_all(doc, "//imageUrl")
+folder <- as.character(as.integer(str_extract(target_ab, "\\d{6}")))
+nodes <- nodes[str_detect(xml_text(nodes), paste0("/", folder, "/"))]
+message("Gambar ", target_ab, " di XML (semua jaringan): ", length(nodes))
+if (length(nodes) == 0) stop("Tidak ada gambar untuk antibodi ini di XML.")
+
+# --- Fungsi bantu -------------------------------------------
+# naik ke ancestor terdekat yang mengandung elemen xp
+climb <- function(n, xp) {
+  a <- n
+  for (k in 1:12) {
+    a <- xml_parent(a)
+    if (inherits(a, "xml_missing") || is.na(xml_name(a))) return(NULL)
+    if (!inherits(xml_find_first(a, xp), "xml_missing")) return(a)
+  }
+  NULL
+}
+txt1 <- function(a, xp) {
+  x <- xml_find_first(a, xp)
+  if (inherits(x, "xml_missing")) NA_character_ else str_squish(xml_text(x))
+}
+snomed_txt <- function(a) {
+  s <- xml_find_all(a, ".//snomed")
+  vapply(s, function(z) {
+    at <- xml_attrs(z)
+    d  <- at[grepl("desc", names(at), ignore.case = TRUE)][1]
+    cd <- at[grepl("code", names(at), ignore.case = TRUE)][1]
+    paste0(d, " (", cd, ")")
+  }, character(1))
+}
+first_ok <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x)) x[1] else NA_character_
+}
+cap <- function(x) {
+  x   <- as.character(x)
+  out <- paste0(toupper(substr(x, 1, 1)), substring(x, 2))
+  out[is.na(x)] <- NA_character_
+  as.character(out)
+}
+
+# --- Parser satu gambar -------------------------------------
+parse_img <- function(n, idx) {
+  pa <- climb(n, ".//patientId")
+
+  # cari blok sel: utamakan di dalam blok pasien, lalu fallback ke ancestor lain
+  ca <- NULL
+  if (!is.null(pa) && length(xml_find_all(pa, ".//cellType")) > 0) ca <- pa
+  if (is.null(ca)) ca <- climb(n, ".//cellType")
+
+  sn  <- if (!is.null(pa)) snomed_txt(pa) else character()
+  tis <- sn[str_detect(sn, "\\(T-\\d+\\)")][1]
+  dg  <- sn[str_detect(sn, "\\(M-\\d+\\)")][1]
+
+  cells <- tibble(cell = character(), staining = character(), intensity = character(),
+                  quantity = character(), location = character())
+  if (!is.null(ca)) {
+    cn <- xml_find_all(ca, ".//cellType")
+    cells <- map_dfr(cn, function(c1) {
+      tc   <- xml_parent(c1)
+      # semua elemen anak selain cellType (level, dsb.)
+      kids <- xml_find_all(tc, "./*[not(self::cellType)]")
+      if (length(kids) == 0) {
+        return(tibble(cell = str_squish(xml_text(c1)), staining = NA_character_,
+                      intensity = NA_character_, quantity = NA_character_,
+                      location = NA_character_))
+      }
+      key <- map_chr(kids, function(k) {
+        t <- xml_attr(k, "type")
+        tolower(if (is.na(t) || t == "") xml_name(k) else t)
+      })
+      val <- str_squish(xml_text(kids))
+      pick <- function(pattern) {
+        i <- which(str_detect(key, pattern))
+        if (length(i)) first_ok(val[i]) else NA_character_
+      }
+      tibble(cell      = str_squish(xml_text(c1)),
+             staining  = pick("^staining"),
+             intensity = pick("^intensity"),
+             quantity  = pick("quantit|fraction|percent"),
+             location  = pick("locat|locali|compart"))
+    })
+    # gabungkan baris duplikat per jenis sel (ambil nilai non-kosong pertama)
+    if (nrow(cells) > 0) {
+      cells <- cells |>
+        group_by(cell) |>
+        summarise(across(c(staining, intensity, quantity, location), first_ok), .groups = "drop")
+    }
+  }
+
+  base <- pa %||% n
+  tibble(antibody   = target_ab,
+         sex        = txt1(base, ".//sex"),
+         age        = txt1(base, ".//age"),
+         patient_id = txt1(base, ".//patientId"),
+         tissue     = tis,
+         diagnosis  = dg,
+         cells      = list(cells),
+         image_url  = paste0("https:", str_remove(xml_text(n), "^https?:")))
+}
+
+# --- Diagnostik: simpan struktur XML sampel pertama ---------
+dbg <- climb(nodes[[1]], ".//patientId") %||% climb(nodes[[1]], ".//cellType")
+if (!is.null(dbg)) {
+  writeLines(as.character(dbg), file.path(out_dir, "debug_struktur.txt"))
+  message("Struktur XML sampel pertama disimpan: debug_struktur.txt")
+}
+
+df <- map2_dfr(nodes, seq_along(nodes), parse_img) |>
+  distinct(image_url, .keep_all = TRUE)
+message("Semua sampel antibodi ", target_ab, " (semua jaringan): ", nrow(df))
+
+# --- Filter: hanya serviks + normal tissue ------------------
+df <- df |>
+  filter(str_detect(tissue, regex(tissue_regex, TRUE)),
+         str_detect(diagnosis, regex(diag_regex, TRUE))) |>
+  arrange(suppressWarnings(as.integer(patient_id)))
+message("Sampel serviks normal: ", nrow(df))
+if (nrow(df) == 0) stop("Tidak ada sampel yang cocok. Cek tissue_regex dan diag_regex.")
+
+# hanya jenis sel yang diminta, urut sesuai cell_types, huruf kapital rapi
+df$cells <- map(df$cells, function(cd) {
+  cd |>
+    filter(cell %in% cell_types) |>
+    arrange(match(cell, cell_types)) |>
+    mutate(across(c(staining, intensity, quantity, location), cap),
+           across(everything(), as.character))
+})
+
+# --- Pengecekan nilai ---------------------------------------
+all_cells <- bind_rows(df$cells)
+for (col in c("cell", "staining", "intensity", "quantity", "location")) {
+  message("Nilai ", col, ":"); print(table(all_cells[[col]], useNA = "ifany"))
+}
+print(df |> mutate(cells = map_chr(cells, ~ paste(.x$cell, .x$staining, .x$intensity,
+                                                  .x$quantity, .x$location,
+                                                  sep = "|", collapse = "; "))))
+
+if (all(is.na(all_cells$quantity)) && all(is.na(all_cells$location))) {
+  warning("Quantity & Location masih kosong semua. Buka debug_struktur.txt di folder output ",
+          "dan kirim isinya agar XPath bisa disesuaikan.")
+}
+
+# --- Unduh gambar penuh -------------------------------------
+clean <- function(x) str_replace_all(str_squish(x), "[^A-Za-z0-9]+", "-")
+short_stain <- function(cd) {
+  if (nrow(cd) == 0) return("NA")
+  paste(map_chr(seq_len(nrow(cd)), function(k)
+    paste0(str_sub(clean(cd$cell[k]), 1, 5), "-", clean(cd$staining[k]))), collapse = "_")
+}
+df <- df |> mutate(
+  file_name = paste0(gene_name, "_", tissue_label, "_", antibody, "_patient", patient_id, "_",
+                     sex, age, "_", map_chr(cells, short_stain), "_", row_number(), ".jpg"),
+  file_path = file.path(img_dir, file_name))
+
+df$status <- map2_chr(df$image_url, df$file_path, function(u, p)
+  tryCatch({ download.file(u, p, mode = "wb", quiet = TRUE); "ok" }, error = function(e) "gagal"))
+message("Unduh: ", paste(names(table(df$status)), table(df$status), collapse = ", "))
+
+# --- CSV ----------------------------------------------------
+csv_df <- df |> select(file_name, antibody, sex, age, patient_id, tissue, diagnosis, image_url, status)
+for (ct in cell_types) for (key in c("staining", "intensity", "quantity", "location")) {
+  csv_df[[paste0(clean(ct), "_", key)]] <- map_chr(df$cells, function(cd) {
+    v <- cd[[key]][cd$cell == ct]; if (length(v)) v[[1]] else NA_character_ })
+}
+readr::write_excel_csv(csv_df, file.path(out_dir, "deskripsi.csv"))
+
+# --- Excel: gambar kiri + blok deskripsi kanan --------------
+na0 <- function(x) ifelse(is.na(x) | x == "", "-", x)
+n_cell_max <- max(1, map_int(df$cells, nrow))
+blk   <- 6 + 5 * n_cell_max + 1
+row_h <- max(17, (img_px * 0.75 + 10) / blk)
+
+wb <- createWorkbook(); addWorksheet(wb, "IHC", gridLines = FALSE)
+setColWidths(wb, "IHC", cols = 1:3, widths = c(img_px / 7 + 3, 24, 30))
+thumb_dir <- file.path(tempdir(), "thumbs"); dir.create(thumb_dir, showWarnings = FALSE)
+
+st_bold  <- createStyle(textDecoration = "bold", valign = "center")
+st_plain <- createStyle(valign = "center")
+st_head  <- createStyle(fgFill = "#E7E6E6", halign = "center", valign = "center")
+st_label <- createStyle(border = "TopBottomLeftRight", borderStyle = "dashed", valign = "center")
+st_value <- createStyle(border = "TopBottomLeftRight", borderStyle = "dashed",
+                        textDecoration = "bold", valign = "center")
+st_sep   <- createStyle(border = "bottom", borderStyle = "thin", borderColour = "grey60")
+
+for (i in seq_len(nrow(df))) {
+  message("Excel: gambar ", i, " dari ", nrow(df))
+  r0 <- (i - 1) * blk + 1; x <- df[i, ]
+  lines <- c(x$antibody, paste0(x$sex, ", age ", x$age), na0(x$tissue),
+             na0(x$diagnosis), paste0("Patient id: ", x$patient_id))
+  for (k in 1:5) {
+    writeData(wb, "IHC", lines[k], startCol = 2, startRow = r0 + k - 1, colNames = FALSE)
+    mergeCells(wb, "IHC", cols = 2:3, rows = r0 + k - 1)
+    addStyle(wb, "IHC", if (k == 1) st_bold else st_plain, rows = r0 + k - 1, cols = 2:3)
+  }
+  cd <- x$cells[[1]]; rr <- r0 + 6
+  for (c in seq_len(nrow(cd))) {
+    writeData(wb, "IHC", cd$cell[c], startCol = 2, startRow = rr, colNames = FALSE)
+    mergeCells(wb, "IHC", cols = 2:3, rows = rr)
+    addStyle(wb, "IHC", st_head, rows = rr, cols = 2:3)
+    labs <- c("Staining:", "Intensity:", "Quantity:", "Location:")
+    vals <- na0(c(cd$staining[c], cd$intensity[c], cd$quantity[c], cd$location[c]))
+    for (k in 1:4) {
+      writeData(wb, "IHC", labs[k], startCol = 2, startRow = rr + k, colNames = FALSE)
+      writeData(wb, "IHC", vals[k], startCol = 3, startRow = rr + k, colNames = FALSE)
+      addStyle(wb, "IHC", st_label, rows = rr + k, cols = 2)
+      addStyle(wb, "IHC", st_value, rows = rr + k, cols = 3)
+    }
+    rr <- rr + 5
+  }
+  addStyle(wb, "IHC", st_sep, rows = r0 + blk - 1, cols = 1:3, stack = TRUE)
+  setRowHeights(wb, "IHC", rows = r0:(r0 + blk - 1), heights = row_h)
+
+  if (file.exists(x$file_path) && file.size(x$file_path) > 0) {
+    tp <- file.path(thumb_dir, paste0("t", i, ".jpg"))
+    image_read(x$file_path) |> image_resize(excel_px) |> image_write(tp, format = "jpeg")
+    insertImage(wb, "IHC", tp, startRow = r0, startCol = 1,
+                width = img_px, height = img_px, units = "px")
+  }
+}
+
+xlsx_path <- file.path(out_dir, paste0(gene_name, "_", tissue_label, "_", target_ab, ".xlsx"))
+ok <- tryCatch({ saveWorkbook(wb, xlsx_path, overwrite = TRUE); TRUE },
+               error = function(e) { message("[GAGAL SIMPAN] ", conditionMessage(e)); FALSE })
+if (!ok) {
+  xlsx_path <- sub("\\.xlsx$", paste0("_", format(Sys.time(), "%H%M%S"), ".xlsx"), xlsx_path)
+  saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+  message("Disimpan dengan nama lain: ", xlsx_path)
+}
+message("\nSelesai! Semua file ada di:\n", out_dir)
+utils::browseURL(out_dir)

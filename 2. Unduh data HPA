@@ -1,0 +1,225 @@
+# ============================================================
+# HPA IHC: gambar RESOLUSI PENUH + deskripsi, SEMUA antibodi
+# Output: Downloads/HPA_IGF1R_cervical_cancer/
+# ============================================================
+pkgs <- c("rvest", "xml2", "httr", "dplyr", "purrr", "stringr",
+          "openxlsx", "magick", "readr", "tibble")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# --- Parameter ----------------------------------------------
+gene_name    <- "IGF1R"
+page_url     <- "https://www.proteinatlas.org/ENSG00000140443-IGF1R/cancer/cervical+cancer"
+cancer_label <- "cervical_cancer"
+excel_px     <- "900x900"
+
+downloads <- file.path(Sys.getenv("USERPROFILE"), "Downloads")
+if (downloads == "Downloads") downloads <- file.path(path.expand("~"), "Downloads")
+out_dir <- file.path(downloads, paste0("HPA_", gene_name, "_", cancer_label))
+img_dir <- file.path(out_dir, "images")
+
+# --- Bersihkan hasil lama (pastikan Excel sudah ditutup) ----
+unlink(img_dir, recursive = TRUE)
+if (dir.exists(out_dir)) {
+  file.remove(list.files(out_dir, pattern = "\\.(xlsx|csv)$", full.names = TRUE))
+}
+dir.create(img_dir, recursive = TRUE, showWarnings = FALSE)
+
+# --- Ambil halaman ------------------------------------------
+resp <- httr::GET(page_url, httr::user_agent("Mozilla/5.0"), httr::timeout(60))
+html_file <- file.path(out_dir, "halaman.html")
+writeBin(httr::content(resp, "raw"), html_file)
+page <- read_html(html_file)
+
+# --- Daftar antibodi di halaman (HPAxxxxxx dan CABxxxxxx) ----
+html_txt <- paste(readLines(html_file, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
+ab_ids <- unique(str_extract_all(html_txt, "(HPA|CAB)\\d{6}")[[1]])
+message("Antibodi ditemukan di halaman: ", paste(ab_ids, collapse = ", "))
+ab_num <- as.character(as.integer(str_extract(ab_ids, "\\d{6}")))
+ab_map <- setNames(ab_ids, ab_num)   # nama = nomor folder gambar, nilai = ID antibodi
+
+# --- Ambil gambar + tooltip ---------------------------------
+imgs <- xml_find_all(page, "//img[contains(@src,'images.proteinatlas.org')]")
+message("Gambar ditemukan di halaman: ", length(imgs))
+
+get_tip <- function(n) {
+  cands <- c(xml_attrs(n), xml_attrs(xml_parent(n)), xml_attrs(xml_parent(xml_parent(n))))
+  cands <- unlist(cands)
+  hit <- cands[str_detect(cands, "Patient id")]
+  if (length(hit)) hit[[1]] else NA_character_
+}
+
+get_full <- function(n) {
+  a <- xml_find_first(n, "ancestor::a[contains(@href,'images.proteinatlas.org')][1]")
+  u <- if (!inherits(a, "xml_missing")) xml_attr(a, "href") else xml_attr(n, "src")
+  u <- str_replace(u, "(_thumb|_small|_medium|_tn)(?=\\.jpe?g)", "")
+  if (str_starts(u, "//")) u <- paste0("https:", u)
+  str_replace(u, "^http://", "https://")
+}
+
+tips <- vapply(imgs, get_tip, character(1))
+srcs <- vapply(imgs, get_full, character(1))
+thumb_src <- vapply(imgs, function(n) xml_attr(n, "src"), character(1))
+
+writeLines(paste0("FULL: ", srcs, "\nTHUMB: ", thumb_src, "\n", tips, "\n-----"),
+           file.path(out_dir, "debug_tooltip.txt"))
+message("URL penuh berasal dari <a href>: ", sum(srcs != thumb_src), " dari ", length(srcs))
+
+if (all(is.na(tips))) {
+  message("\n[DIAGNOSTIK] Tooltip tidak ketemu. Atribut gambar pertama:")
+  print(xml_attrs(imgs[[1]]))
+  print(xml_attrs(xml_parent(imgs[[1]])))
+  stop("Kirim output di atas ke saya.")
+}
+
+# --- Parse tooltip ------------------------------------------
+parse_tip <- function(tip, src) {
+  tip <- str_replace_all(tip, "(?i)<br\\s*/?>|&lt;br\\s*/?&gt;|</(div|p|tr|li)>", "\n")
+  tip <- str_replace_all(tip, "<[^>]+>", "")
+  tip <- str_replace_all(tip, "&nbsp;|\u00a0", " ")
+  lines <- str_squish(unlist(str_split(tip, "\n")))
+  lines <- lines[lines != ""]
+
+  i <- 1
+  while (i <= length(lines)) {
+    if (i < length(lines) && str_detect(lines[i], ":$") &&
+        !str_detect(lines[i + 1], "^[A-Za-z ]+:")) {
+      lines[i] <- paste(lines[i], lines[i + 1])
+      lines <- lines[-(i + 1)]
+    } else if (i > 1 && str_detect(lines[i], "^\\([TM]-\\d+\\)$")) {
+      lines[i - 1] <- paste(lines[i - 1], lines[i])
+      lines <- lines[-i]
+      i <- i - 1
+    }
+    i <- i + 1
+  }
+
+  g <- function(pat) {
+    h <- lines[str_detect(lines, regex(pat, TRUE))]
+    if (length(h)) h[[1]] else NA_character_
+  }
+  val <- function(label) {
+    x <- g(paste0("^", label, ":"))
+    str_trim(str_remove(x, regex(paste0("^", label, ":"), TRUE)))
+  }
+
+  sexage <- str_match(g("^(Female|Male),\\s*age"), "(Female|Male),\\s*age\\s*(\\d+)")
+  m_lines <- lines[str_detect(lines, "\\(M-\\d+\\)")]
+  diag <- m_lines[!str_detect(m_lines, regex("^Normal tissue", TRUE))]
+
+  # antibodi dari nomor folder URL gambar, dicocokkan dengan ID di halaman
+  folder <- as.character(as.integer(str_extract(src, "(?<=proteinatlas\\.org/)\\d+")))
+  ab <- unname(ab_map[folder])
+  if (is.na(ab)) ab <- paste0("UNKNOWN_", folder)
+
+  tibble(
+    antibody   = ab,
+    sex        = sexage[2],
+    age        = sexage[3],
+    patient_id = str_trim(str_remove(g("^Patient id"), regex("^Patient id:\\s*", TRUE))),
+    tissue     = g("\\(T-\\d+\\)"),
+    diagnosis  = if (length(diag)) diag[[1]] else NA_character_,
+    cell_type  = "Tumor cells",
+    staining   = val("Antibody staining"),
+    intensity  = val("Intensity"),
+    quantity   = val("Quantity"),
+    location   = val("Location"),
+    image_url  = src
+  )
+}
+
+df <- purrr::map2_dfr(tips, srcs, function(t, s) {
+  if (is.na(t)) NULL else parse_tip(t, s)
+}) |>
+  filter(is.na(diagnosis) | !str_detect(diagnosis, regex("^Normal", TRUE))) |>
+  distinct(image_url, .keep_all = TRUE) |>
+  arrange(match(antibody, ab_ids), suppressWarnings(as.integer(patient_id)))
+
+message("Sampel dengan deskripsi lengkap: ", nrow(df))
+message("Jumlah gambar per antibodi:")
+print(table(df$antibody))
+if (any(str_starts(df$antibody, "UNKNOWN"))) {
+  message("[PERINGATAN] Ada gambar dengan antibodi tidak dikenali (UNKNOWN_...). ",
+          "Kirim 3 baris pertama debug_tooltip.txt ke saya.")
+}
+print(head(df, 8))
+
+# --- Unduh gambar resolusi penuh ----------------------------
+clean <- function(x) str_replace_all(str_squish(x), "[^A-Za-z0-9]+", "-")
+df <- df |>
+  mutate(
+    file_name = paste0(gene_name, "_", cancer_label, "_", antibody, "_patient", patient_id,
+                       "_", sex, age, "_", clean(staining), "_", clean(intensity), "_",
+                       clean(quantity), "_", row_number(), ".jpg"),
+    file_path = file.path(img_dir, file_name)
+  )
+
+df$status <- purrr::map2_chr(df$image_url, df$file_path, function(u, p) {
+  tryCatch({ download.file(u, p, mode = "wb", quiet = TRUE); "ok" },
+           error = function(e) "gagal")
+})
+message("Unduh: ", paste(names(table(df$status)), table(df$status), collapse = ", "))
+
+ok_files <- df$file_path[file.exists(df$file_path) & file.size(df$file_path) > 0]
+if (length(ok_files) == 0) stop("Tidak ada gambar yang berhasil diunduh. Kirim isi debug_tooltip.txt.")
+inf <- image_info(image_read(ok_files[1]))
+message("Ukuran gambar pertama: ", inf$width, " x ", inf$height, " px")
+if (inf$width < 400) message("[PERINGATAN] Gambar masih kecil. Kirim 3 baris pertama debug_tooltip.txt ke saya.")
+
+readr::write_excel_csv(df |> select(-file_path), file.path(out_dir, "deskripsi.csv"))
+
+# --- Excel: gambar kiri + blok deskripsi kanan --------------
+na0 <- function(x) ifelse(is.na(x) | x == "", "-", x)
+wb <- createWorkbook()
+addWorksheet(wb, "IHC", gridLines = FALSE)
+
+blk <- 12; row_h <- 17; img_px <- 600
+setColWidths(wb, "IHC", cols = 1:3, widths = c(36, 16, 30))
+thumb_dir <- file.path(tempdir(), "thumbs"); dir.create(thumb_dir, showWarnings = FALSE)
+
+st_bold  <- createStyle(textDecoration = "bold", valign = "center")
+st_plain <- createStyle(valign = "center")
+st_head  <- createStyle(fgFill = "#E7E6E6", halign = "center", valign = "center")
+st_label <- createStyle(border = "TopBottomLeftRight", borderStyle = "dashed", valign = "center")
+st_value <- createStyle(border = "TopBottomLeftRight", borderStyle = "dashed",
+                        textDecoration = "bold", valign = "center")
+st_sep   <- createStyle(border = "bottom", borderStyle = "thin", borderColour = "grey60")
+
+for (i in seq_len(nrow(df))) {
+  r0 <- (i - 1) * blk + 1
+  x  <- df[i, ]
+  lines <- c(x$antibody, paste0(x$sex, ", age ", x$age), na0(x$tissue),
+             na0(x$diagnosis), paste0("Patient id: ", x$patient_id))
+  for (k in 1:5) {
+    writeData(wb, "IHC", lines[k], startCol = 2, startRow = r0 + k - 1, colNames = FALSE)
+    mergeCells(wb, "IHC", cols = 2:3, rows = r0 + k - 1)
+    addStyle(wb, "IHC", if (k == 1) st_bold else st_plain, rows = r0 + k - 1, cols = 2:3)
+  }
+  writeData(wb, "IHC", x$cell_type, startCol = 2, startRow = r0 + 6, colNames = FALSE)
+  mergeCells(wb, "IHC", cols = 2:3, rows = r0 + 6)
+  addStyle(wb, "IHC", st_head, rows = r0 + 6, cols = 2:3)
+
+  labs <- c("Staining:", "Intensity:", "Quantity:", "Location:")
+  vals <- na0(c(x$staining, x$intensity, x$quantity, x$location))
+  for (k in 1:4) {
+    writeData(wb, "IHC", labs[k], startCol = 2, startRow = r0 + 6 + k, colNames = FALSE)
+    writeData(wb, "IHC", vals[k], startCol = 3, startRow = r0 + 6 + k, colNames = FALSE)
+    addStyle(wb, "IHC", st_label, rows = r0 + 6 + k, cols = 2)
+    addStyle(wb, "IHC", st_value, rows = r0 + 6 + k, cols = 3)
+  }
+  addStyle(wb, "IHC", st_sep, rows = r0 + blk - 1, cols = 1:3, stack = TRUE)
+  setRowHeights(wb, "IHC", rows = r0:(r0 + blk - 1), heights = row_h)
+
+  if (file.exists(x$file_path) && file.size(x$file_path) > 0) {
+    tp <- file.path(thumb_dir, paste0("t", i, ".jpg"))
+    image_read(x$file_path) |> image_resize(excel_px) |> image_write(tp, format = "jpeg")
+    insertImage(wb, "IHC", tp, startRow = r0, startCol = 1,
+                width = img_px, height = img_px, units = "px")
+  }
+}
+
+xlsx_path <- file.path(out_dir, paste0(gene_name, "_", cancer_label, ".xlsx"))
+saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+message("\nSelesai! Semua file ada di:\n", out_dir)
+utils::browseURL(out_dir)

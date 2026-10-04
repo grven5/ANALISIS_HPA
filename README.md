@@ -19,3 +19,7 @@
    - Ganti link HPA (awalnya CCND1) sesuai Gene diambil (contoh: https://www.proteinatlas.org/ENSG00000110092-CCND1/tissue/cervix#img)
    - Ganti jaringan yang diinginkan
    - Input antibodi staining yang ingin diambil (contoh: Antibody HPA045563, Antibody CAB010268, dll)
+   - Pilih kelompok jaringan (misal: Glandular cells, ....)
+  
+     <img width="300" height="150" alt="image" src="https://github.com/user-attachments/assets/ed234e67-3c1d-43a0-bce5-3d7ec71c43da" />
+

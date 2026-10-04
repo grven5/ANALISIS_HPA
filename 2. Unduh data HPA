@@ -12,7 +12,8 @@ invisible(lapply(pkgs, library, character.only = TRUE))
 gene_name    <- "IGF1R"
 page_url     <- "https://www.proteinatlas.org/ENSG00000140443-IGF1R/cancer/cervical+cancer"
 cancer_label <- "cervical_cancer"
-excel_px     <- "900x900"
+excel_px     <- "900x900"   # ketajaman gambar di dalam Excel
+img_px       <- 500         # ukuran tampil di Excel (192 px = 2 inci)
 
 downloads <- file.path(Sys.getenv("USERPROFILE"), "Downloads")
 if (downloads == "Downloads") downloads <- file.path(path.expand("~"), "Downloads")
@@ -75,9 +76,16 @@ if (all(is.na(tips))) {
 
 # --- Parse tooltip ------------------------------------------
 parse_tip <- function(tip, src) {
-  tip <- str_replace_all(tip, "(?i)<br\\s*/?>|&lt;br\\s*/?&gt;|</(div|p|tr|li)>", "\n")
-  tip <- str_replace_all(tip, "<[^>]+>", "")
+  # 1) <br> dan penutup blok -> baris baru
+  tip <- str_replace_all(tip, "(?i)<br\\s*/?>|&lt;br\\s*/?&gt;|</(div|p|tr|li|table|td|th)\\s*>", "\n")
+  # 2) buang HANYA tag HTML yang dikenal; "<25%" atau ">75%" tidak akan tersentuh
+  tip <- str_replace_all(
+    tip,
+    "(?i)</?(b|i|u|strong|em|span|div|p|tr|td|th|table|tbody|thead|ul|li|a|font|small|sup|sub|img)(\\s[^>]*)?>",
+    "")
   tip <- str_replace_all(tip, "&nbsp;|\u00a0", " ")
+  tip <- str_replace_all(tip, "&lt;", "<")
+  tip <- str_replace_all(tip, "&gt;", ">")
   lines <- str_squish(unlist(str_split(tip, "\n")))
   lines <- lines[lines != ""]
 
@@ -137,6 +145,18 @@ df <- purrr::map2_dfr(tips, srcs, function(t, s) {
   arrange(match(antibody, ab_ids), suppressWarnings(as.integer(patient_id)))
 
 message("Sampel dengan deskripsi lengkap: ", nrow(df))
+
+# --- Pengecekan nilai yang terbaca --------------------------
+message("Semua nilai Quantity yang terbaca:")
+print(table(df$quantity, useNA = "ifany"))
+message("Semua nilai Intensity yang terbaca:")
+print(table(df$intensity, useNA = "ifany"))
+message("Semua nilai Location yang terbaca:")
+print(table(df$location, useNA = "ifany"))
+if (any(is.na(df$quantity) | df$quantity == "" | str_detect(df$quantity, ":"))) {
+  message("[PERINGATAN] Ada Quantity kosong/rusak. Kirim bagian debug_tooltip.txt untuk pasien terkait.")
+}
+
 message("Jumlah gambar per antibodi:")
 print(table(df$antibody))
 if (any(str_starts(df$antibody, "UNKNOWN"))) {
@@ -147,11 +167,16 @@ print(head(df, 8))
 
 # --- Unduh gambar resolusi penuh ----------------------------
 clean <- function(x) str_replace_all(str_squish(x), "[^A-Za-z0-9]+", "-")
+clean_q <- function(x) {   # untuk nama file: pertahankan arti "<" dan ">"
+  x <- str_replace_all(x, "<", "lt")
+  x <- str_replace_all(x, ">", "gt")
+  clean(x)
+}
 df <- df |>
   mutate(
     file_name = paste0(gene_name, "_", cancer_label, "_", antibody, "_patient", patient_id,
                        "_", sex, age, "_", clean(staining), "_", clean(intensity), "_",
-                       clean(quantity), "_", row_number(), ".jpg"),
+                       clean_q(quantity), "_", row_number(), ".jpg"),
     file_path = file.path(img_dir, file_name)
   )
 
@@ -174,7 +199,7 @@ na0 <- function(x) ifelse(is.na(x) | x == "", "-", x)
 wb <- createWorkbook()
 addWorksheet(wb, "IHC", gridLines = FALSE)
 
-blk <- 12; row_h <- 17; img_px <- 600
+blk <- 12; row_h <- 17
 setColWidths(wb, "IHC", cols = 1:3, widths = c(36, 16, 30))
 thumb_dir <- file.path(tempdir(), "thumbs"); dir.create(thumb_dir, showWarnings = FALSE)
 

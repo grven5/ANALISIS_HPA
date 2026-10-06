@@ -23,3 +23,5 @@
   
      <img width="300" height="150" alt="image" src="https://github.com/user-attachments/assets/ed234e67-3c1d-43a0-bce5-3d7ec71c43da" />
 
+   - Namun terkadang HPA mempunyai keterbatasan, sehingga data diunduh melalui XML bukan melalui link HPA
+
